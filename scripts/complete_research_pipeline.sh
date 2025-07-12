@@ -5,12 +5,15 @@
 
 set -e  # Exit on any error
 
+# Absolute path to the directory that contains THIS script
+SCRIPT_ROOT=$(cd "$(dirname "$0")" && pwd)
+
 # Default values
 RESEARCH_TOPIC=""
 OUTPUT_DIR="./research_pipeline"
 MAX_PAPERS=30
 SAMPLE_QUESTIONS=50
-MODEL="gpt41"
+MODEL="gpt-4.1"
 RELEVANCE_MODEL="scout"
 SPECIALTY="expert"
 QUICK_MODE=false
@@ -145,7 +148,7 @@ if [[ "$SKIP_DOWNLOAD" != true ]]; then
     cd literature_data
     
     echo "Discovering and downloading papers on: '$RESEARCH_TOPIC'"
-    ../scripts/literature_discovery.sh \
+    $SCRIPT_ROOT/literature_discovery.sh \
         --keyword "$RESEARCH_TOPIC" \
         --generate-keywords \
         --max-papers "$MAX_PAPERS" \
@@ -204,7 +207,7 @@ if [[ "$SKIP_BENCHMARK" != true ]]; then
     cd benchmark_results
     
     echo "Running comprehensive model evaluation..."
-    ../scripts/model_benchmark.sh \
+    $SCRIPT_ROOT/model_benchmark.sh \
         --questions "../$QUESTIONS_FILE" \
         --grader "$MODEL" \
         --sample-size "$SAMPLE_QUESTIONS" \
@@ -246,7 +249,7 @@ if [[ "$SKIP_REASONING" != true ]]; then
     fi
     
     echo "Generating detailed reasoning traces with $SPECIALTY perspective..."
-    ../scripts/reasoning_analysis.sh \
+    $SCRIPT_ROOT/reasoning_analysis.sh \
         --questions "../$QUESTIONS_FILE" \
         --model "$MODEL" \
         --specialty "$SPECIALTY" \

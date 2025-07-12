@@ -1,0 +1,33 @@
+# Argonium Model Configuration
+# Copy this file to model_servers.yaml and configure your endpoints
+
+servers:
+  # OpenAI GPT-4
+  - shortname: "gpt41"
+    server: "OpenAI GPT-4"
+    openai_api_key: "${OPENAI_API_KEY}"
+    openai_api_base: "https://api.openai.com/v1"
+    openai_model: "gpt-4"
+
+  # OpenAI GPT-3.5 Turbo
+  - shortname: "gpt35"
+    server: "OpenAI GPT-3.5 Turbo"
+    openai_api_key: "${OPENAI_API_KEY}"
+    openai_api_base: "https://api.openai.com/v1"
+    openai_model: "gpt-3.5-turbo"
+
+  # Example custom endpoint
+  - shortname: "scout"
+    server: "Custom Model Endpoint"
+    openai_api_key: "${CUSTOM_API_KEY}"
+    openai_api_base: "https://your-endpoint.com/v1"
+    openai_model: "your-model-name"
+
+  # Claude (via API)
+  - shortname: "claude3"
+    server: "Anthropic Claude"
+    openai_api_key: "${ANTHROPIC_API_KEY}"
+    openai_api_base: "https://api.anthropic.com/v1"
+    openai_model: "claude-3-sonnet-20240229"
+
+  # Add more models as needed

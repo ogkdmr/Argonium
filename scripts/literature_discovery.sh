@@ -5,11 +5,17 @@
 
 set -e  # Exit on any error
 
+# Absolute path to the directory that contains THIS script
+SCRIPT_ROOT=$(cd "$(dirname "$0")" && pwd)
+
+# Project root directory
+PROJECT_ROOT="$SCRIPT_ROOT/.."
+
 # Default values
 BASE_KEYWORD=""
-OUTPUT_DIR="./research_output"
+OUTPUT_DIR="$SCRIPT_ROOT/research_output"
 MAX_PAPERS=50
-MODEL="gpt41"
+MODEL="gpt-4.1"
 RELEVANCE_MODEL="scout"
 GENERATE_KEYWORDS=false
 KEYWORDS_FILE=""
@@ -116,26 +122,29 @@ if [[ -z "$ANALYZE_ONLY" ]]; then
     if [[ -n "$KEYWORDS_FILE" ]]; then
         # Use keywords from file
         echo "Using keywords from file: $KEYWORDS_FILE"
-        python ../download_papers_v8.py \
+        python $PROJECT_ROOT/download_papers_v8.py \
             --keywords-file "../$KEYWORDS_FILE" \
             --relevance-model "$RELEVANCE_MODEL" \
             --max-relevant-papers "$MAX_PAPERS" \
-            --skip-relevance-check false
+            --skip-relevance-check false \ 
+            --config $PROJECT_ROOT/model_servers.yaml
     elif [[ "$GENERATE_KEYWORDS" == true ]]; then
         # Generate keywords and download
         echo "Generating keywords from base: '$BASE_KEYWORD'"
-        python ../download_papers_v8.py \
+        python $PROJECT_ROOT/download_papers_v8.py \
             --generate-keywords "$BASE_KEYWORD" \
             --model "$MODEL" \
             --relevance-model "$RELEVANCE_MODEL" \
-            --max-relevant-papers "$MAX_PAPERS"
+            --max-relevant-papers "$MAX_PAPERS" \
+            --config $PROJECT_ROOT/model_servers.yaml
     else
         # Use single keyword
         echo "Using single keyword: '$BASE_KEYWORD'"
-        python ../download_papers_v8.py \
+        python $PROJECT_ROOT/download_papers_v8.py \
             --keywords "$BASE_KEYWORD" \
             --relevance-model "$RELEVANCE_MODEL" \
-            --max-relevant-papers "$MAX_PAPERS"
+            --max-relevant-papers "$MAX_PAPERS" \
+            --config $PROJECT_ROOT/model_servers.yaml
     fi
     
     echo "✓ Paper download completed"
@@ -154,7 +163,7 @@ if [[ "$ORGANIZE_FILES" == true ]]; then
     for dir in */; do
         if [[ -d "$dir" && "$dir" != "PROCESSED/" ]]; then
             echo "Classifying papers in: $dir"
-            python ../classify_papers.py "$dir" \
+            python $SCRIPT_ROOT/classify_papers.py "$dir" \
                 --classification-model "$RELEVANCE_MODEL" \
                 --organize-files \
                 --max-files 1000
