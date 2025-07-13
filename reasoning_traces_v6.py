@@ -9,6 +9,7 @@ import re
 import sys
 import textwrap
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
@@ -67,6 +68,12 @@ def parse_arguments():
         help='Specialty persona to adopt (e.g., "microbiologist", "quantum physicist", "historian") (default: expert)',
     )
     parser.add_argument(
+        "--reasoning-mode",
+        choices=["detailed", "focused", "efficient"],
+        default="detailed",
+        help="Reasoning approach: detailed (thorough analysis - current method), focused (structured reasoning with early elimination), efficient (streamlined for accuracy testing) (default: detailed)",
+    )
+    parser.add_argument(
         "--save-interval",
         type=int,
         default=10,
@@ -121,6 +128,10 @@ def parse_arguments():
     advanced_group.add_argument(
         "--capture-incorrect",
         help="Output file to capture incorrect answers with both predicted and correct answers",
+    )
+    advanced_group.add_argument(
+        "--argonium-results",
+        help="JSON file with existing argonium results (from argonium_score_parallel) to compare against",
     )
 
     return parser.parse_args()
@@ -269,7 +280,7 @@ I'm well-versed in the foundational principles, current developments, and ongoin
 
 def extract_mc_options(question_text: str) -> List[str]:
     """
-    Extract multiple choice options from the question text.
+    Extract multiple choice options from the question text without regex.
 
     Args:
         question_text: The full multiple choice question text
@@ -284,20 +295,37 @@ def extract_mc_options(question_text: str) -> List[str]:
         return []
 
     options_text = parts[1]
+    options = []
+    
+    # Process line by line looking for option patterns
+    lines = options_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Check if line starts with option pattern (basic patterns only)
+        # Look for "1) ", "2) ", "A) ", "B) ", "1. ", "2. ", "A. ", "B. ", etc.
+        if len(line) >= 3:
+            first_char = line[0]
+            second_char = line[1]
+            
+            # Check for numbered options
+            if first_char.isdigit() and second_char in [')', '.'] and len(line) > 2 and line[2] == ' ':
+                option_text = line[3:].strip()
+                # Remove asterisks marking correct answers
+                if option_text.endswith('(*)'):
+                    option_text = option_text[:-3].strip()
+                options.append(option_text)
+            # Check for lettered options
+            elif first_char.isalpha() and second_char in [')', '.'] and len(line) > 2 and line[2] == ' ':
+                option_text = line[3:].strip()
+                # Remove asterisks marking correct answers
+                if option_text.endswith('(*)'):
+                    option_text = option_text[:-3].strip()
+                options.append(option_text)
 
-    # Match different option formats like "1.", "1)", "A.", "A)", etc.
-    options = re.findall(
-        r"(?:^|\n)(?:\d+|\w)[.)] (.*?)(?=(?:\n(?:\d+|\w)[.)])|$)",
-        options_text,
-        re.DOTALL,
-    )
-
-    # Clean up the options (remove asterisks marking correct answers, etc.)
-    cleaned_options = [
-        re.sub(r"\s*\(\*\)\s*$", "", option.strip()) for option in options
-    ]
-
-    return cleaned_options
+    return options
 
 
 def extract_thought_process_from_text(text: str, option_count: int) -> Dict[str, str]:
@@ -531,15 +559,303 @@ def detect_choice_identifier_type(question_text):
         return "letter"
 
 
+# Choice identifier extraction removed - all evaluation done by grader model
+
+
+# Choice identifier normalization removed - all evaluation done by grader model
+
+
+# Option content extraction removed - all evaluation done by grader model
+
+
+def check_content_consistency(model_answer, correct_option_content):
+    """
+    Check if the model's answer content is consistent with the correct option content.
+    Copied from argonium_score_parallel_v9.py for exact compatibility.
+
+    Args:
+        model_answer (str): The model's full answer
+        correct_option_content (str): The content of the correct option
+
+    Returns:
+        bool: True if the content seems consistent, False otherwise
+    """
+    if not model_answer or not correct_option_content:
+        return False
+
+    # Clean and normalize both texts for comparison
+    model_clean = re.sub(r"\s+", " ", model_answer.lower().strip())
+    option_clean = re.sub(r"\s+", " ", correct_option_content.lower().strip())
+
+    # If the correct option content is substantial (>15 chars), look for significant overlap
+    if len(option_clean) > 15:
+        # Look for at least 60% of the option content words in the model answer
+        option_words = set(re.findall(r"\w+", option_clean))
+        model_words = set(re.findall(r"\w+", model_clean))
+
+        if len(option_words) > 0:
+            overlap = len(option_words.intersection(model_words))
+            overlap_ratio = overlap / len(option_words)
+            return overlap_ratio >= 0.6
+
+    # For shorter content, look for exact substring match
+    return option_clean in model_clean
+
+
+def generate_reasoning_prompt(
+    specialty: str, persona: str, question_text: str, options: List[str], reasoning_mode: str
+) -> str:
+    """
+    Generate reasoning prompt based on the selected reasoning mode.
+    
+    Args:
+        specialty: Expert specialty
+        persona: Expert persona description
+        question_text: The question text
+        options: List of answer options
+        reasoning_mode: "detailed", "focused", or "efficient"
+    
+    Returns:
+        Complete prompt string
+    """
+    # Check if scientific field
+    is_scientific = any(
+        field in specialty.lower()
+        for field in [
+            "scientist", "biologist", "physicist", "chemist", "geologist",
+            "astronomer", "mathematician", "engineer",
+        ]
+    )
+    
+    # Split the question text to get just the question part (without options)
+    question_parts = question_text.split("\n\n", 1)
+    question_only = question_parts[0] if len(question_parts) > 0 else question_text
+    
+    # Base prompt structure
+    base_prompt = f"""You are a {specialty} reasoning through a multiple-choice question. Your persona: {persona}
+
+QUESTION:
+{question_only}
+
+ANSWER OPTIONS:
+"""
+    
+    # Add options
+    for i, option in enumerate(options):
+        base_prompt += f"{i+1}. {option}\n"
+    
+    # Add reasoning instructions based on mode
+    if reasoning_mode == "detailed":
+        return base_prompt + generate_overthink_instructions(specialty, is_scientific)
+    elif reasoning_mode == "focused":
+        return base_prompt + generate_balanced_instructions(specialty, is_scientific)
+    elif reasoning_mode == "efficient":
+        return base_prompt + generate_minimal_instructions(specialty, is_scientific)
+    else:
+        # Default to detailed
+        return base_prompt + generate_overthink_instructions(specialty, is_scientific)
+
+
+def generate_overthink_instructions(specialty: str, is_scientific: bool) -> str:
+    """Generate detailed overthinking instructions (current method)."""
+    if is_scientific:
+        return f"""
+TASK:
+Please provide an extremely detailed internal monologue as if you are a {specialty} thinking through this problem. For each answer option:
+1. Treat each option as a hypothesis that you're carefully considering
+2. Use specialized terminology and concepts from your field in your reasoning
+3. Consider relevant mechanisms, processes, theoretical frameworks, and evidence
+4. Reason through the implications and logical consequences of each option
+5. Reference relevant principles, theories, or frameworks from your field
+6. Consider edge cases, exceptions, and nuances for each option
+7. Express uncertainty and weigh evidence where appropriate
+
+Structure your response as an expert's stream of consciousness:
+- Analyze each option thoroughly in sequential order (Option 1, then Option 2, etc.)
+- For each option, begin with "Hmm, let me consider option X..."
+- After analyzing ALL options, explicitly predict which answer you think is correct using its NUMBER (e.g., "I predict option 3 is correct")
+- Then explain your reasoning for your prediction - what principles and evidence led you to this conclusion?
+- Finally, indicate your confidence level in your prediction (high, medium, or low) and explain why
+
+Output your reasoning in JSON format with the following structure:
+{{
+  "thought_process": {{
+    "option_1": "Detailed reasoning about option 1 as a hypothesis",
+    "option_2": "Detailed reasoning about option 2 as a hypothesis",
+    ... (all options in numerical order)
+  }},
+  "prediction": {{
+    "predicted_answer": "The option number you predict is correct (e.g., 3)",
+    "prediction_reasoning": "Reasoning for why you predict this answer is correct",
+    "confidence_level": "Your confidence level (high, medium, or low)",
+    "confidence_explanation": "Why you have this level of confidence in your prediction"
+  }},
+  "scientific_conclusion": "Final synthesized assessment"
+}}
+
+IMPORTANT: Your response must be a valid, parseable JSON object. For each option, include detailed reasoning of at least 150-200 words. You MUST make a prediction and specify ONLY the option number (e.g., '3', NOT 'Option 3').
+"""
+    else:
+        return f"""
+TASK:
+Please provide an extremely detailed internal monologue as if you are a {specialty} thinking through this problem. For each answer option:
+1. Treat each option as a possibility that you're carefully considering
+2. Use specialized terminology and concepts from your field in your reasoning
+3. Consider relevant frameworks, methodologies, contexts, and evidence
+4. Reason through the implications and logical consequences of each option
+5. Reference relevant principles, theories, or frameworks from your domain of expertise
+6. Consider alternative interpretations, exceptions, and nuances for each option
+7. Express uncertainty and weigh evidence where appropriate
+
+Structure your response as an expert's stream of consciousness:
+- Analyze each option thoroughly in sequential order (Option 1, then Option 2, etc.)
+- For each option, begin with "Hmm, let me consider option X..."
+- After analyzing ALL options, explicitly predict which answer you think is correct using its NUMBER (e.g., "I predict option 3 is correct")
+- Then explain your reasoning for your prediction - what principles and evidence led you to this conclusion?
+- Finally, indicate your confidence level in your prediction (high, medium, or low) and explain why
+
+Output your reasoning in JSON format with the following structure:
+{{
+  "thought_process": {{
+    "option_1": "Detailed reasoning about option 1",
+    "option_2": "Detailed reasoning about option 2",
+    ... (all options in numerical order)
+  }},
+  "prediction": {{
+    "predicted_answer": "The option number you predict is correct (e.g., 3)",
+    "prediction_reasoning": "Reasoning for why you predict this answer is correct",
+    "confidence_level": "Your confidence level (high, medium, or low)",
+    "confidence_explanation": "Why you have this level of confidence in your prediction"
+  }},
+  "conclusion": "Final synthesized assessment"
+}}
+
+IMPORTANT: Your response must be a valid, parseable JSON object. For each option, include detailed reasoning of at least 150-200 words. You MUST make a prediction and specify ONLY the option number (e.g., '3', NOT 'Option 3').
+"""
+
+
+def generate_balanced_instructions(specialty: str, is_scientific: bool) -> str:
+    """Generate focused reasoning instructions (focused but thorough)."""
+    if is_scientific:
+        return f"""
+TASK:
+As a {specialty}, analyze this question efficiently but thoroughly. Focus on the key scientific principles that differentiate the options:
+
+1. Identify the core scientific concept being tested
+2. Quickly eliminate obviously incorrect options with brief reasoning
+3. Focus detailed analysis on the most plausible 2-3 options
+4. Use your scientific knowledge to identify the decisive factors
+5. Make a confident prediction based on the strongest evidence
+
+Structure your response efficiently:
+- Briefly explain the key scientific principle at stake
+- Quickly dismiss clearly wrong options (1-2 sentences each)
+- Provide focused analysis of viable options (3-4 sentences each)
+- Make your prediction with clear scientific reasoning
+- State your confidence level
+
+Output in JSON format:
+{{
+  "key_principle": "The main scientific concept being tested",
+  "quick_elimination": {{
+    "dismissed_options": ["List of obviously wrong option numbers"],
+    "reasoning": "Brief explanation why these are clearly incorrect"
+  }},
+  "focused_analysis": {{
+    "viable_options": ["List of plausible option numbers"],
+    "detailed_reasoning": "Focused analysis of the key differentiating factors"
+  }},
+  "prediction": {{
+    "predicted_answer": "The option number (e.g., 3)",
+    "prediction_reasoning": "Clear scientific reasoning for your choice",
+    "confidence_level": "high/medium/low",
+    "confidence_explanation": "Why you have this confidence level"
+  }},
+  "scientific_conclusion": "Final assessment"
+}}
+
+IMPORTANT: Be efficient - don't overthink. Focus on the key distinguishing factors. Predict the option number only (e.g., '3').
+"""
+    else:
+        return f"""
+TASK:
+As a {specialty}, analyze this question efficiently but thoroughly. Focus on the key factors that differentiate the options:
+
+1. Identify the core concept or principle being tested
+2. Quickly eliminate obviously incorrect options with brief reasoning
+3. Focus detailed analysis on the most plausible 2-3 options
+4. Use your expertise to identify the decisive factors
+5. Make a confident prediction based on the strongest evidence
+
+Structure your response efficiently:
+- Briefly explain the key principle at stake
+- Quickly dismiss clearly wrong options (1-2 sentences each)
+- Provide focused analysis of viable options (3-4 sentences each)
+- Make your prediction with clear reasoning
+- State your confidence level
+
+Output in JSON format:
+{{
+  "key_principle": "The main concept being tested",
+  "quick_elimination": {{
+    "dismissed_options": ["List of obviously wrong option numbers"],
+    "reasoning": "Brief explanation why these are clearly incorrect"
+  }},
+  "focused_analysis": {{
+    "viable_options": ["List of plausible option numbers"],
+    "detailed_reasoning": "Focused analysis of the key differentiating factors"
+  }},
+  "prediction": {{
+    "predicted_answer": "The option number (e.g., 3)",
+    "prediction_reasoning": "Clear reasoning for your choice",
+    "confidence_level": "high/medium/low",
+    "confidence_explanation": "Why you have this confidence level"
+  }},
+  "conclusion": "Final assessment"
+}}
+
+IMPORTANT: Be efficient - don't overthink. Focus on the key distinguishing factors. Predict the option number only (e.g., '3').
+"""
+
+
+def generate_minimal_instructions(specialty: str, is_scientific: bool) -> str:
+    """Generate efficient reasoning instructions (streamlined approach)."""
+    return f"""
+TASK:
+As a {specialty}, answer this question directly and efficiently:
+
+1. Identify what the question is really asking
+2. Apply your core knowledge to eliminate wrong answers
+3. Select the best answer with concise reasoning
+4. State your confidence
+
+Be direct and focused - trust your expertise.
+
+Output in JSON format:
+{{
+  "quick_analysis": "Brief explanation of what the question tests",
+  "elimination": "Quick reasoning for dismissing wrong options",
+  "prediction": {{
+    "predicted_answer": "The option number (e.g., 3)",
+    "prediction_reasoning": "Concise reasoning for your choice (2-3 sentences)",
+    "confidence_level": "high/medium/low"
+  }}
+}}
+
+IMPORTANT: Be concise and direct. Trust your instincts. Predict the option number only (e.g., '3').
+"""
+
+
 def generate_argonium_style_prediction(
-    question: str, options: List[str], client: OpenAI, model_name: str, specialty: str
+    full_question_text: str, options: List[str], client: OpenAI, model_name: str, specialty: str
 ) -> Dict[str, Any]:
     """
     Generate a prediction using Argonium's simplified, direct approach.
+    Uses the exact same input format as argonium_score_parallel.
 
     Args:
-        question: The question text (without options)
-        options: List of answer options
+        full_question_text: The complete question text (may include embedded options)
+        options: List of answer options (used for fallback reconstruction only)
         client: OpenAI client
         model_name: Model name to use
         specialty: Expert specialty
@@ -547,19 +863,35 @@ def generate_argonium_style_prediction(
     Returns:
         Dictionary with argonium prediction results
     """
-    # Detect choice identifier type (letter/number) using unified logic
-    full_question = (
-        question + "\n\n" + "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
+    # Use the question text exactly as provided (like argonium_score_parallel does)
+    # This ensures identical input format to argonium_score_parallel
+    full_question = full_question_text
+    
+    # Simple check for embedded options without regex - look for numbered patterns
+    has_embedded_options = any(
+        line.strip().startswith(f"{i}.") or line.strip().startswith(f"{i})")
+        for line in full_question_text.split('\n')
+        for i in range(1, 10)
     )
+    
+    if not has_embedded_options and options:
+        # Only reconstruct if options are separate (like make_v21 format)
+        full_question += "\n\n" + "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(options))
+        log_message("Reconstructed question with separate options", log_level="DEBUG")
+    else:
+        # Question already has embedded options (like HR dataset) - use as-is
+        log_message("Using question with embedded options as-is", log_level="DEBUG")
+    
+    # Detect choice identifier type (letter/number) using unified logic - same as argonium_score_parallel
     id_type_in_question = detect_choice_identifier_type(full_question)
 
-    # Determine label format for prompts
+    # Determine label format for prompts - exact match to argonium_score_parallel
     if id_type_in_question == "number":
         label_format = "number (1, 2, 3, etc.)"
     else:
         label_format = "letter (A, B, C, etc.)"
 
-    # System prompt designed for multiple-choice questions (adapted from Argonium)
+    # System prompt designed for multiple-choice questions - exact match to argonium_score_parallel
     system_message = (
         "You are an expert at multiple-choice questions. "
         "Think through the question step by step, but provide only a concise final answer. "
@@ -569,77 +901,44 @@ def generate_argonium_style_prediction(
         "Do not include the question restatement or list of alternatives in your response."
     )
 
+    # User message - exact match to argonium_score_parallel 
     user_message = (
         f"Please answer this multiple-choice question. Think through it carefully:\n"
         f"- First, restate the question to yourself\n"
         f"- Then, consider all the alternative answers provided\n"
         f"- Finally, provide your response with ONLY the correct {label_format} "
         f"followed by 2-3 sentences explaining why this choice is correct.\n\n"
-        f"Question:\n{question}\n\n"
-        f"Options:\n"
+        f"Question:\n{full_question}"
     )
 
-    # Add options to the prompt
-    for i, option in enumerate(options):
-        user_message += f"{i+1}. {option}\n"
-
     try:
-        # Create the completion request with low temperature for consistency
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
+        # Check if we need to skip temperature (for reasoning models like o3 and o4mini) - same as argonium
+        skip_temperature = any(
+            name in model_name.lower() for name in ["o3", "o4-mini", "o4mini"]
+        )
+
+        # Prepare parameters like argonium does
+        params = {
+            "model": model_name,
+            "messages": [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.0,  # Low temperature for consistent results (like Argonium)
-            max_tokens=500,
-        )
+        }
+
+        # Add temperature only for models that support it
+        if not skip_temperature:
+            params["temperature"] = 0.0
+
+        response = client.chat.completions.create(**params)
 
         response_text = response.choices[0].message.content.strip()
 
-        # Extract the predicted option number using similar logic to Argonium
-        predicted_answer = "Could not determine"
-        predicted_num = None
-
-        # Try multiple patterns to extract the prediction
-        predict_patterns = [
-            r"(?:option|answer|choice)\s*(?:number|#)?\s*(\d+)",
-            r"(?:^|\n)\s*(\d+)[.):,]",
-            r"(?:the\s+)?correct\s+(?:option|answer|choice)\s+(?:is|would be)\s+(\d+)",
-            r"I\s+(?:choose|select|pick)\s+(?:option|answer|choice)\s*(\d+)",
-            r"(\d+)\s+is\s+(?:the\s+)?(?:correct|right|best)",
-            r"(?:option|answer|choice)\s+(\d+)\s+(?:is|seems|appears\s+to\s+be)\s+correct",
-        ]
-
-        for pattern in predict_patterns:
-            match = re.search(pattern, response_text, re.IGNORECASE)
-            if match:
-                predicted_num = int(match.group(1))
-                predicted_answer = f"Option {predicted_num}"
-                break
-
-        # Also try letter extraction if number didn't work
-        if predicted_answer == "Could not determine":
-            letter_patterns = [
-                r"(?:option|answer|choice)\s*([A-E])",
-                r"(?:^|\n)\s*([A-E])[.):,]",
-                r"(?:the\s+)?correct\s+(?:option|answer|choice)\s+(?:is|would be)\s+([A-E])",
-                r"([A-E])\s+is\s+(?:the\s+)?(?:correct|right|best)",
-            ]
-
-            for pattern in letter_patterns:
-                match = re.search(pattern, response_text, re.IGNORECASE)
-                if match:
-                    letter = match.group(1).upper()
-                    predicted_num = ord(letter) - ord("A") + 1
-                    predicted_answer = f"Option {predicted_num}"
-                    break
-
+        # No regex processing - let grader model handle all evaluation
+        # Return raw response for grader model to evaluate
         return {
-            "predicted_answer": predicted_answer,
-            "predicted_num": predicted_num,
             "raw_response": response_text,
-            "extraction_successful": predicted_num is not None,
+            "model_answer": response_text,  # For compatibility with argonium grader
         }
 
     except Exception as e:
@@ -647,10 +946,8 @@ def generate_argonium_style_prediction(
             f"Error generating Argonium-style prediction: {e}", log_level="ERROR"
         )
         return {
-            "predicted_answer": "Error occurred",
-            "predicted_num": None,
             "raw_response": f"Error: {str(e)}",
-            "extraction_successful": False,
+            "model_answer": f"Error: {str(e)}",
         }
 
 
@@ -716,7 +1013,7 @@ Answer: {argonium_pred}
 Response: {argonium_response}
 
 TASK: 
-If both methods give the SAME answer, simply state: "Both methods agree on the same answer: [answer]. The reasoning approaches differ but lead to the same conclusion."
+If both Reasoning Traces and Argonium-Style methods give the SAME answer, simply state: "Both methods agree on the same answer: [answer]. The reasoning approaches differ but lead to the same conclusion."
 
 If the methods give DIFFERENT answers, write a clear paragraph that:
 1. States which answer you believe is correct as a {specialty} expert
@@ -887,6 +1184,102 @@ IMPORTANT: Be generous in your interpretation - if the predicted answer clearly 
         }
 
 
+def load_argonium_results(argonium_file: str) -> Dict[str, Any]:
+    """
+    Load and parse argonium results file from argonium_score_parallel.
+    
+    Args:
+        argonium_file: Path to the argonium results JSON file
+        
+    Returns:
+        Dictionary with parsed argonium results
+    """
+    try:
+        with open(argonium_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        log_message(f"Loaded argonium results from {argonium_file}")
+        log_message(f"Argonium file contains {len(data.get('results', []))} questions")
+        log_message(f"Argonium overall accuracy: {data.get('metadata', {}).get('overall_accuracy', 'unknown'):.1%}")
+        
+        return data
+        
+    except Exception as e:
+        log_message(f"Error loading argonium results file {argonium_file}: {e}", log_level="ERROR")
+        return None
+
+
+def verify_question_match(reasoning_question: str, argonium_question: str, 
+                         grading_client: OpenAI, grading_model_name: str) -> Dict[str, Any]:
+    """
+    Use grading model to verify that two questions are the same.
+    
+    Args:
+        reasoning_question: Question from reasoning traces
+        argonium_question: Question from argonium results file
+        grading_client: OpenAI client for grading
+        grading_model_name: Model name for grading
+        
+    Returns:
+        Dictionary with verification results
+    """
+    try:
+        verification_prompt = f"""You are comparing two questions to determine if they are identical or equivalent.
+
+QUESTION A:
+{reasoning_question}
+
+QUESTION B:
+{argonium_question}
+
+TASK:
+Determine if these questions are the same. They should be considered a match if:
+1. The text is identical or nearly identical (ignoring minor formatting differences)
+2. The core question being asked is the same
+3. All answer options are present and in the same order
+
+Respond with a JSON object:
+{{
+  "is_match": true/false,
+  "confidence": "high/medium/low",
+  "reasoning": "Brief explanation of your determination"
+}}"""
+
+        response = grading_client.chat.completions.create(
+            model=grading_model_name,
+            messages=[
+                {"role": "system", "content": "You are an expert at comparing questions for identity. Be thorough but precise."},
+                {"role": "user", "content": verification_prompt}
+            ],
+            temperature=0.1,
+            max_tokens=300
+        )
+        
+        output = response.choices[0].message.content.strip()
+        
+        try:
+            result = json.loads(output)
+            result["verification_successful"] = True
+            return result
+        except json.JSONDecodeError:
+            return {
+                "is_match": False,
+                "confidence": "low", 
+                "reasoning": "Failed to parse verification response",
+                "verification_successful": False,
+                "raw_output": output
+            }
+            
+    except Exception as e:
+        return {
+            "is_match": False,
+            "confidence": "low",
+            "reasoning": f"Error during verification: {str(e)}",
+            "verification_successful": False,
+            "error": str(e)
+        }
+
+
 def generate_reasoning_trace(
     question_data: Dict[str, Any],
     client: OpenAI,
@@ -896,6 +1289,7 @@ def generate_reasoning_trace(
     grading_client: OpenAI = None,
     grading_model_name: str = None,
     verbose_grading: bool = False,
+    reasoning_mode: str = "detailed",
 ) -> Dict[str, Any]:
     """
     Generate a reasoning trace for a multiple choice question.
@@ -913,10 +1307,10 @@ def generate_reasoning_trace(
     _current_model_name = model_name
     global _processed_questions, _total_questions
 
-    # Extract question components
-    question_text = question_data["question"]
-    correct_answer = question_data["answer"]
-    context_text = question_data["text"]
+    # Extract question components with graceful defaults (match argonium_score_parallel approach)
+    question_text = question_data.get("question", "")
+    correct_answer = question_data.get("answer", "")
+    context_text = question_data.get("text", "")
 
     # Extract options from the question text
     options = extract_mc_options(question_text)
@@ -968,20 +1362,9 @@ def generate_reasoning_trace(
     # Get the expert persona
     persona = get_expert_persona(specialty)
 
-    # Construct the prompt for generating the reasoning trace - without relying on context
-    # Adapt wording based on whether this is a scientific field
-    is_scientific = any(
-        field in specialty.lower()
-        for field in [
-            "scientist",
-            "biologist",
-            "physicist",
-            "chemist",
-            "geologist",
-            "astronomer",
-            "mathematician",
-            "engineer",
-        ]
+    # Generate prompt based on reasoning mode
+    prompt = generate_reasoning_prompt(
+        specialty, persona, question_text, options, reasoning_mode
     )
 
     if is_scientific:
@@ -1149,13 +1532,30 @@ Structure your response as an expert's stream of consciousness:
                     # Extract scientific conclusion
                     conclusion = extract_conclusion_from_text(response_text)
 
-                    # Create structured JSON
-                    json_content = {
-                        "thought_process": thought_process,
-                        "prediction": prediction,
-                        "scientific_conclusion": conclusion,
-                        "extracted_from_text": True,
-                    }
+                    # Create structured JSON based on reasoning mode
+                    if reasoning_mode == "efficient":
+                        json_content = {
+                            "quick_analysis": "",
+                            "elimination": "",
+                            "prediction": prediction,
+                            "extracted_from_text": True,
+                        }
+                    elif reasoning_mode == "focused":
+                        json_content = {
+                            "key_principle": "",
+                            "quick_elimination": {"dismissed_options": [], "reasoning": ""},
+                            "focused_analysis": {"viable_options": [], "detailed_reasoning": ""},
+                            "prediction": prediction,
+                            "scientific_conclusion": conclusion,
+                            "extracted_from_text": True,
+                        }
+                    else:  # detailed mode
+                        json_content = {
+                            "thought_process": thought_process,
+                            "prediction": prediction,
+                            "scientific_conclusion": conclusion,
+                            "extracted_from_text": True,
+                        }
             else:
                 # No code block found, extract structured data directly from raw text
                 log_message(
@@ -1223,13 +1623,30 @@ Structure your response as an expert's stream of consciousness:
                         # Extract scientific conclusion
                         conclusion = extract_conclusion_from_text(cleaned_text)
 
-                        # Create structured JSON
-                        json_content = {
-                            "thought_process": thought_process,
-                            "prediction": prediction,
-                            "scientific_conclusion": conclusion,
-                            "extracted_from_text": True,
-                        }
+                        # Create structured JSON based on reasoning mode
+                        if reasoning_mode == "minimal":
+                            json_content = {
+                                "quick_analysis": "",
+                                "elimination": "",
+                                "prediction": prediction,
+                                "extracted_from_text": True,
+                            }
+                        elif reasoning_mode == "focused":
+                            json_content = {
+                                "key_principle": "",
+                                "quick_elimination": {"dismissed_options": [], "reasoning": ""},
+                                "focused_analysis": {"viable_options": [], "detailed_reasoning": ""},
+                                "prediction": prediction,
+                                "scientific_conclusion": conclusion,
+                                "extracted_from_text": True,
+                            }
+                        else:  # detailed/overthink mode
+                            json_content = {
+                                "thought_process": thought_process,
+                                "prediction": prediction,
+                                "scientific_conclusion": conclusion,
+                                "extracted_from_text": True,
+                            }
                 else:
                     # No embedded JSON, do full extraction
                     # Extract thought process for each option
@@ -1243,13 +1660,30 @@ Structure your response as an expert's stream of consciousness:
                     # Extract scientific conclusion
                     conclusion = extract_conclusion_from_text(cleaned_text)
 
-                    # Create structured JSON
-                    json_content = {
-                        "thought_process": thought_process,
-                        "prediction": prediction,
-                        "scientific_conclusion": conclusion,
-                        "extracted_from_text": True,
-                    }
+                    # Create structured JSON based on reasoning mode
+                    if reasoning_mode == "efficient":
+                        json_content = {
+                            "quick_analysis": "",
+                            "elimination": "",
+                            "prediction": prediction,
+                            "extracted_from_text": True,
+                        }
+                    elif reasoning_mode == "focused":
+                        json_content = {
+                            "key_principle": "",
+                            "quick_elimination": {"dismissed_options": [], "reasoning": ""},
+                            "focused_analysis": {"viable_options": [], "detailed_reasoning": ""},
+                            "prediction": prediction,
+                            "scientific_conclusion": conclusion,
+                            "extracted_from_text": True,
+                        }
+                    else:  # detailed mode
+                        json_content = {
+                            "thought_process": thought_process,
+                            "prediction": prediction,
+                            "scientific_conclusion": conclusion,
+                            "extracted_from_text": True,
+                        }
 
                 # If we couldn't extract meaningful structured data, save the raw text
                 if not thought_process and not prediction["predicted_answer"]:
@@ -1310,22 +1744,51 @@ Structure your response as an expert's stream of consciousness:
                 log_level="INFO",
             )
 
-            # Get just the question part without options for Argonium-style prompt
-            question_parts = question_text.split("\n\n", 1)
-            question_only = (
-                question_parts[0] if len(question_parts) > 0 else question_text
+            # Use the FULL question text like argonium_score_parallel does (not just question_only)
+            # This ensures identical input format to argonium_score_parallel
+            
+            # Generate Argonium-style prediction with full question text
+            argonium_prediction = generate_argonium_style_prediction(
+                question_text, options, client, model_name, specialty
             )
 
-            # Generate Argonium-style prediction
-            argonium_prediction = generate_argonium_style_prediction(
-                question_only, options, client, model_name, specialty
-            )
+            # Grade the argonium-style prediction using the same grader as argonium_score_parallel
+            if grading_client is not None and grading_model_name is not None:
+                correct_answer = options[correct_option_index] if correct_option_index < len(options) else ""
+                argonium_model_answer = argonium_prediction.get("model_answer", "")
+                
+                if argonium_model_answer and correct_answer:
+                    # Use the grading function to evaluate the argonium-style prediction
+                    argonium_grading_result = grade_answer(
+                        predicted_answer=argonium_model_answer,
+                        correct_answer=correct_answer,
+                        question_text=question_text,
+                        options=options,
+                        grading_client=grading_client,
+                        grading_model_name=grading_model_name,
+                        verbose=verbose_grading,
+                    )
+                    
+                    # Add grading results to argonium prediction
+                    argonium_prediction["grading_result"] = argonium_grading_result
+                    argonium_prediction["prediction_correct"] = argonium_grading_result.get("is_correct", False)
+                    argonium_prediction["predicted_answer"] = argonium_grading_result.get("extracted_option_number", "Could not determine")
+                    argonium_prediction["extraction_successful"] = argonium_grading_result.get("grading_successful", False)
+                    
+                    # Extract predicted option number if available
+                    if argonium_grading_result.get("extracted_option_number", "unknown") != "unknown":
+                        try:
+                            argonium_prediction["predicted_num"] = int(argonium_grading_result["extracted_option_number"])
+                        except (ValueError, TypeError):
+                            argonium_prediction["predicted_num"] = None
+                    else:
+                        argonium_prediction["predicted_num"] = None
 
             # Generate comparison analysis
             comparison_analysis = generate_prediction_comparison(
                 reasoning_data,
                 argonium_prediction,
-                question_only,
+                question_text,
                 options,
                 client,
                 model_name,
@@ -1360,7 +1823,8 @@ Structure your response as an expert's stream of consciousness:
             predicted_answer = reasoning_data.get("prediction", {}).get(
                 "predicted_answer", ""
             )
-            correct_answer = question_data.get("answer", "")
+            # Use the correct option text instead of raw answer text
+            correct_answer = options[correct_option_index] if correct_option_index < len(options) else ""
 
             if predicted_answer and correct_answer:
                 grading_result = grade_answer(
@@ -1648,11 +2112,8 @@ def print_readable_output(
     global _current_model_name
     try:
         print("\n" + "=" * 80)
-        # Split the question to get just the question part (without options)
-        question_parts = question_data["question"].split("\n\n", 1)
-        question_only = (
-            question_parts[0] if len(question_parts) > 0 else question_data["question"]
-        )
+        # Get the full question text
+        question_only = question_data["question"]
         print(f"QUESTION: {question_only}")
         print("-" * 80)
 
@@ -1936,6 +2397,57 @@ def print_readable_output(
             )
             print(formatted_response)
 
+            # Add file comparison if available
+            if reasoning_trace.get("argonium_file_comparison"):
+                file_comparison = reasoning_trace["argonium_file_comparison"]
+                argonium_file_result = file_comparison.get("argonium_result", {})
+                question_match = file_comparison.get("question_match", {})
+                
+                print(f"\n📋 COMPARISON WITH ARGONIUM FILE:")
+                if question_match.get("is_match", False):
+                    file_answer = argonium_file_result.get("model_answer", "")
+                    file_score = argonium_file_result.get("score", 0)
+                    file_correct = file_score >= 1
+                    
+                    new_answer = argonium_pred.get("predicted_answer", "Unknown")
+                    new_extraction_successful = argonium_pred.get("extraction_successful", False)
+                    new_correct = argonium_pred.get("prediction_correct", False)
+                    
+                    print(f"   File prediction: {file_answer[:100]}{'...' if len(file_answer) > 100 else ''}")
+                    print(f"   File result: {file_score} ({'✓ Correct' if file_correct else '✗ Incorrect'})")
+                    print(f"   New prediction: {new_answer}")
+                    print(f"   New result: {'✓ Correct' if new_correct else '✗ Incorrect'} ({'✓ Extracted' if new_extraction_successful else '✗ Failed to extract'})")
+                    
+                    # Clear comparison based on actual outcomes
+                    if file_correct and new_correct:
+                        print("   🎯 Both methods got the correct answer")
+                    elif file_correct and not new_correct:
+                        if new_extraction_successful:
+                            print("   📉 File method correct, new method chose wrong answer")
+                        else:
+                            print("   ⚠️  File method correct, new method failed to extract answer")
+                    elif not file_correct and new_correct:
+                        print("   📈 File method wrong, new method got correct answer")
+                    else:
+                        if new_extraction_successful:
+                            print("   ❌ Both methods chose wrong answers")
+                        else:
+                            print("   💥 File method wrong, new method failed to extract")
+                        
+                    # Answer content comparison
+                    file_choice = argonium_file_result.get("evaluation", {}).get("model_choice", "")
+                    new_choice = argonium_pred.get("extracted_choice", "")
+                    
+                    if file_choice and new_choice:
+                        if str(file_choice).upper() == str(new_choice).upper():
+                            print("   🎯 Answer match: Same choice selected")
+                        else:
+                            print(f"   🔄 Answer difference: File='{file_choice}', New='{new_choice}'")
+                    
+                else:
+                    print("   ⚠️  Question verification failed - comparison skipped")
+                    print(f"   Reason: {question_match.get('reasoning', 'Unknown')}")
+
             print("\n" + "-" * 80)
             print("🤔 COMPARISON ANALYSIS:")
             print("-" * 80)
@@ -1974,31 +2486,21 @@ def print_readable_output(
         print("=" * 80 + "\n")
 
 
-def generate_whole_trace_analysis(
-    reasoning_traces: List[Dict[str, Any]],
-    client: OpenAI,
-    model_name: str,
-    specialty: str = "expert",
-) -> Dict[str, Any]:
+def process_trace_batch(trace_batch: List[Tuple[int, Dict[str, Any]]]) -> Tuple[List[Dict], Dict[str, int], Dict[str, List]]:
     """
-    Generate a coherent narrative analysis from the collected reasoning traces.
-
+    Process a batch of traces in parallel to extract summaries and statistics.
+    
     Args:
-        reasoning_traces: List of reasoning trace dictionaries
-        model_name: The model name to use for generating the analysis
-        specialty: The expert specialty persona to adopt
-
+        trace_batch: List of (index, trace) tuples
+        
     Returns:
-        Dictionary containing the whole trace analysis
+        Tuple of (batch_summary, batch_stats, batch_confidence)
     """
-    log_message("Generating whole trace analysis...", log_level="INFO")
-
-    # Prepare a summary of all the reasoning traces
-    trace_summary = []
-    accuracy_stats = {"correct": 0, "incorrect": 0, "total": 0}
-    confidence_breakdown = {"high": [], "medium": [], "low": []}
-
-    for i, trace in enumerate(reasoning_traces):
+    batch_summary = []
+    batch_stats = {"correct": 0, "incorrect": 0, "total": 0, "ungraded": 0}
+    batch_confidence = {"high": [], "medium": [], "low": []}
+    
+    for i, trace in trace_batch:
         if "reasoning" not in trace:
             continue
 
@@ -2019,19 +2521,18 @@ def generate_whole_trace_analysis(
 
         # Update statistics (only count graded predictions)
         if is_correct is not None:
-            accuracy_stats["total"] += 1
+            batch_stats["total"] += 1
             if is_correct:
-                accuracy_stats["correct"] += 1
+                batch_stats["correct"] += 1
             else:
-                accuracy_stats["incorrect"] += 1
+                batch_stats["incorrect"] += 1
         else:
             # Track ungraded predictions
-            accuracy_stats.setdefault("ungraded", 0)
-            accuracy_stats["ungraded"] += 1
+            batch_stats["ungraded"] += 1
 
         # Track confidence levels (only for graded predictions)
-        if is_correct is not None and confidence.lower() in confidence_breakdown:
-            confidence_breakdown[confidence.lower()].append(
+        if is_correct is not None and confidence.lower() in batch_confidence:
+            batch_confidence[confidence.lower()].append(
                 {
                     "question_num": i + 1,
                     "correct": is_correct,
@@ -2040,7 +2541,7 @@ def generate_whole_trace_analysis(
             )
 
         # Create a summary entry
-        trace_summary.append(
+        batch_summary.append(
             {
                 "question_number": i + 1,
                 "question_snippet": question,
@@ -2056,6 +2557,84 @@ def generate_whole_trace_analysis(
                 + "...",
             }
         )
+    
+    return batch_summary, batch_stats, batch_confidence
+
+
+def generate_whole_trace_analysis(
+    reasoning_traces: List[Dict[str, Any]],
+    client: OpenAI,
+    model_name: str,
+    specialty: str = "expert",
+) -> Dict[str, Any]:
+    """
+    Generate a coherent narrative analysis from the collected reasoning traces.
+
+    Args:
+        reasoning_traces: List of reasoning trace dictionaries
+        model_name: The model name to use for generating the analysis
+        specialty: The expert specialty persona to adopt
+
+    Returns:
+        Dictionary containing the whole trace analysis
+    """
+    log_message("Generating whole trace analysis...", log_level="INFO")
+
+    # Prepare a summary of all the reasoning traces using parallel processing
+    log_message("Processing traces in parallel for analysis...", log_level="INFO")
+    
+    # Determine optimal batch size and number of workers
+    num_traces = len(reasoning_traces)
+    max_workers = min(4, max(1, num_traces // 20))  # 4 workers max, at least 20 traces per worker
+    batch_size = max(1, num_traces // max_workers)
+    
+    # Split traces into batches with their original indices
+    batches = []
+    for i in range(0, num_traces, batch_size):
+        batch = list(enumerate(reasoning_traces[i:i + batch_size], start=i))
+        if batch:  # Only add non-empty batches
+            batches.append(batch)
+    
+    log_message(f"Processing {num_traces} traces in {len(batches)} batches using {max_workers} workers", log_level="INFO")
+    
+    # Process batches in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {
+            executor.submit(process_trace_batch, batch): i 
+            for i, batch in enumerate(batches)
+        }
+        
+        # Collect results as they complete
+        batch_results = {}
+        for future in as_completed(future_to_batch):
+            batch_id = future_to_batch[future]
+            try:
+                batch_results[batch_id] = future.result()
+            except Exception as e:
+                log_message(f"Error processing batch {batch_id}: {e}", log_level="ERROR")
+                # Create empty result for failed batch
+                batch_results[batch_id] = ([], {"correct": 0, "incorrect": 0, "total": 0, "ungraded": 0}, {"high": [], "medium": [], "low": []})
+    
+    # Merge results from all batches in order
+    trace_summary = []
+    accuracy_stats = {"correct": 0, "incorrect": 0, "total": 0, "ungraded": 0}
+    confidence_breakdown = {"high": [], "medium": [], "low": []}
+    
+    for batch_id in sorted(batch_results.keys()):
+        batch_summary, batch_stats, batch_confidence = batch_results[batch_id]
+        
+        # Merge summaries
+        trace_summary.extend(batch_summary)
+        
+        # Merge statistics
+        for key in accuracy_stats:
+            accuracy_stats[key] += batch_stats.get(key, 0)
+        
+        # Merge confidence data
+        for level in confidence_breakdown:
+            confidence_breakdown[level].extend(batch_confidence.get(level, []))
+    
+    log_message(f"Processed {len(trace_summary)} trace summaries from {num_traces} total traces", log_level="INFO")
 
     # Calculate accuracy percentage
     accuracy_percentage = (
@@ -2315,6 +2894,21 @@ def main():
             )
             sys.exit(1)
 
+    # Load argonium results for comparison if provided
+    argonium_data = None
+    argonium_results_map = {}
+    if args.argonium_results:
+        argonium_data = load_argonium_results(args.argonium_results)
+        if argonium_data:
+            # Create a map of question_id to results for easier lookup
+            for result in argonium_data.get('results', []):
+                question_id = result.get('question_id')
+                if question_id:
+                    argonium_results_map[question_id] = result
+            log_message(f"Mapped {len(argonium_results_map)} argonium results for comparison")
+        else:
+            log_message("Failed to load argonium results file", log_level="ERROR")
+
     # Initialize results list
     results = []
 
@@ -2341,12 +2935,12 @@ def main():
         log_message(f"Error reading input file: {e}", log_level="ERROR")
         sys.exit(1)
 
-    # Filter for multiple choice questions only
-    mc_questions = [q for q in questions_data if q.get("type") == "multiple-choice"]
-
+    # Process all questions like argonium_score_parallel (no filtering by type)
+    mc_questions = questions_data
+    
     if not mc_questions:
         log_message(
-            "No multiple choice questions found in the input file.", log_level="ERROR"
+            "No questions found in the input file.", log_level="ERROR"
         )
         sys.exit(1)
 
@@ -2380,7 +2974,40 @@ def main():
             grading_client=grading_client,
             grading_model_name=grading_model_name,
             verbose_grading=args.verbose_grading,
+            reasoning_mode=args.reasoning_mode,
         )
+        
+        # Add argonium file comparison if available
+        current_question_index = starting_index + i + 1
+        if argonium_results_map and current_question_index in argonium_results_map:
+            argonium_result = argonium_results_map[current_question_index]
+            
+            # Verify question match using grading model
+            if grading_client and grading_model_name:
+                question_match = verify_question_match(
+                    question.get("question", ""),
+                    argonium_result.get("question", ""),
+                    grading_client,
+                    grading_model_name
+                )
+                trace["argonium_file_comparison"] = {
+                    "question_match": question_match,
+                    "argonium_result": argonium_result,
+                    "argonium_file_path": args.argonium_results
+                }
+                
+                if not question_match.get("is_match", False):
+                    log_message(f"Warning: Question {current_question_index} doesn't match argonium file question", log_level="WARNING")
+                else:
+                    log_message(f"Question {current_question_index} verified to match argonium file", log_level="DEBUG")
+            else:
+                # Store without verification if no grading model
+                trace["argonium_file_comparison"] = {
+                    "question_match": {"is_match": None, "reasoning": "No grading model available for verification"},
+                    "argonium_result": argonium_result,
+                    "argonium_file_path": args.argonium_results
+                }
+        
         results.append(trace)
 
         # Print readable output to console (with stream analysis if whole-trace-analysis is enabled)
@@ -2539,6 +3166,9 @@ def main():
 
     # Check if grading model was used
     grading_model_used = any(trace.get("grading_result") for trace in results)
+    
+    # Check if dual prediction (Argonium-style) was used
+    dual_prediction_used = any(trace.get("dual_prediction") for trace in results)
 
     print(f"Total questions processed: {total_predictions}")
     print(f"Questions with grading: {total_graded}")
@@ -2546,11 +3176,125 @@ def main():
         print(f"Questions without grading: {ungraded_predictions} (accuracy unknown)")
 
     if total_graded > 0:
+        print(f"\n🔍 REASONING TRACES METHOD ACCURACY:")
         print(
             f"Overall accuracy: {correct_predictions}/{total_graded} correct predictions ({accuracy_percentage:.1f}%)"
         )
         print(f"Verification method: grading model")
         print(f"Grading model: {grading_model_name}")
+        
+        # Analyze dual prediction accuracy if available
+        if dual_prediction_used:
+            print(f"\n🎯 ARGONIUM-STYLE METHOD ACCURACY:")
+            
+            # Calculate Argonium method statistics
+            argonium_correct = 0
+            argonium_total = 0
+            both_correct = 0
+            both_incorrect = 0
+            reasoning_correct_argonium_wrong = 0
+            reasoning_wrong_argonium_correct = 0
+            agreement_but_both_wrong = 0
+            agreement_and_both_right = 0
+            
+            for trace in results:
+                if trace.get("prediction_correct") is not None and trace.get("dual_prediction"):
+                    dual_data = trace["dual_prediction"]
+                    argonium_pred = dual_data.get("argonium_prediction", {})
+                    
+                    # Check if argonium prediction is correct (compare with grading result)
+                    reasoning_correct = trace.get("prediction_correct", False)
+                    
+                    # For argonium accuracy, we need to check if the argonium prediction matches the correct answer
+                    # We'll use the same grading logic but for the argonium prediction
+                    argonium_answer = argonium_pred.get("predicted_answer", "")
+                    correct_answer = trace.get("correct_answer", "")
+                    reasoning_answer = trace.get("reasoning", {}).get("prediction", {}).get("predicted_answer", "")
+                    
+                    # Use proper grading model for argonium accuracy calculation
+                    argonium_correct_bool = False
+                    argonium_num = None
+                    reasoning_num = None
+                    
+                    # Always try to extract numeric values for agreement analysis
+                    import re
+                    if argonium_answer:
+                        argonium_match = re.search(r'\b(\d+)\b', str(argonium_answer))
+                        if argonium_match:
+                            argonium_num = int(argonium_match.group(1))
+                    
+                    if reasoning_answer:
+                        reasoning_match = re.search(r'\b(\d+)\b', str(reasoning_answer))
+                        if reasoning_match:
+                            reasoning_num = int(reasoning_match.group(1))
+                    
+                    if argonium_answer and correct_answer and grading_client is not None and grading_model_name is not None:
+                        # Get question data for proper grading
+                        question_text = trace.get("question", "")
+                        options = trace.get("options", [])
+                        
+                        # Use the same grading function as for reasoning traces
+                        argonium_grading_result = grade_answer(
+                            predicted_answer=argonium_answer,
+                            correct_answer=correct_answer,
+                            question_text=question_text,
+                            options=options,
+                            grading_client=grading_client,
+                            grading_model_name=grading_model_name,
+                            verbose=False  # Keep this quiet to avoid too much output
+                        )
+                        
+                        argonium_correct_bool = argonium_grading_result.get("is_correct", False)
+                    elif argonium_answer and correct_answer:
+                        # Fallback to simple regex matching if no grading model available
+                        correct_match = re.search(r'\b(\d+)\b', str(correct_answer))
+                        
+                        if argonium_num is not None and correct_match:
+                            correct_num = int(correct_match.group(1))
+                            argonium_correct_bool = (argonium_num == correct_num)
+                    
+                    argonium_total += 1
+                    if argonium_correct_bool:
+                        argonium_correct += 1
+                    
+                    # Agreement analysis
+                    if reasoning_correct and argonium_correct_bool:
+                        both_correct += 1
+                        agreement_and_both_right += 1
+                    elif not reasoning_correct and not argonium_correct_bool:
+                        both_incorrect += 1
+                        # Check if they agreed on the same wrong answer
+                        if argonium_num is not None and reasoning_num is not None and argonium_num == reasoning_num:
+                            agreement_but_both_wrong += 1
+                    elif reasoning_correct and not argonium_correct_bool:
+                        reasoning_correct_argonium_wrong += 1
+                    elif not reasoning_correct and argonium_correct_bool:
+                        reasoning_wrong_argonium_correct += 1
+            
+            if argonium_total > 0:
+                argonium_accuracy = (argonium_correct / argonium_total) * 100
+                print(f"Overall accuracy: {argonium_correct}/{argonium_total} correct predictions ({argonium_accuracy:.1f}%)")
+                
+                print(f"\n📊 METHOD COMPARISON ANALYSIS:")
+                print(f"Questions with both Reasoning Traces + Argonium-Style predictions: {argonium_total}")
+                print(f"Both Reasoning Traces and Argonium-Style correct: {both_correct} ({(both_correct/argonium_total)*100:.1f}%)")
+                print(f"Both Reasoning Traces and Argonium-Style incorrect: {both_incorrect} ({(both_incorrect/argonium_total)*100:.1f}%)")
+                print(f"Reasoning Traces correct, Argonium-Style wrong: {reasoning_correct_argonium_wrong}")
+                print(f"Reasoning Traces wrong, Argonium-Style correct: {reasoning_wrong_argonium_correct}")
+                
+                print(f"\n⚠️  AGREEMENT BUT BOTH WRONG:")
+                print(f"Cases where Reasoning Traces and Argonium-Style agree but both incorrect: {agreement_but_both_wrong}")
+                if agreement_but_both_wrong > 0:
+                    print(f"This represents {(agreement_but_both_wrong/argonium_total)*100:.1f}% of all dual predictions")
+                
+                total_agreement = agreement_and_both_right + agreement_but_both_wrong
+                if argonium_total > 0:
+                    agreement_rate = (total_agreement / argonium_total) * 100
+                    print(f"\n🤝 OVERALL AGREEMENT RATE (Reasoning Traces ↔ Argonium-Style): {total_agreement}/{argonium_total} ({agreement_rate:.1f}%)")
+            else:
+                print("No dual predictions available for comparison")
+        else:
+            print("\n💡 Use --dual-prediction to enable Argonium-style method comparison")
     else:
         print("Overall accuracy: No predictions could be graded (0 graded questions)")
         print("Verification method: None (no grading model available)")
@@ -2577,6 +3321,142 @@ def main():
             print(
                 f"• Low confidence: {low_confidence_correct}/{low_confidence_total} correct ({low_acc:.1f}%)"
             )
+
+    # Argonium file comparison analysis if available
+    if argonium_data:
+        print("\n📋 ARGONIUM FILE COMPARISON ANALYSIS:")
+        print("=" * 80)
+        
+        # Count questions with file comparisons
+        file_comparison_count = 0
+        matched_questions = 0
+        file_vs_new_matches = 0
+        file_vs_new_discrepancies = 0
+        argonium_file_accuracy = argonium_data.get('metadata', {}).get('overall_accuracy', 0) * 100
+        
+        for trace in results:
+            if trace.get("argonium_file_comparison"):
+                file_comparison_count += 1
+                
+                comparison = trace["argonium_file_comparison"]
+                question_match = comparison.get("question_match", {})
+                argonium_file_result = comparison.get("argonium_result", {})
+                
+                if question_match.get("is_match", False):
+                    matched_questions += 1
+                    
+                    # Compare file result with new argonium-style prediction if available
+                    if trace.get("dual_prediction"):
+                        file_score = argonium_file_result.get("score", 0)
+                        
+                        # Get new argonium prediction correctness
+                        dual_data = trace["dual_prediction"]
+                        argonium_pred = dual_data.get("argonium_prediction", {})
+                        argonium_answer = argonium_pred.get("predicted_answer", "")
+                        correct_answer = trace.get("correct_answer", "")
+                        
+                        # Use grading model to check new prediction if available
+                        new_argonium_correct = False
+                        if argonium_answer and correct_answer and grading_client and grading_model_name:
+                            question_text = trace.get("question", "")
+                            options = trace.get("options", [])
+                            
+                            grading_result = grade_answer(
+                                predicted_answer=argonium_answer,
+                                correct_answer=correct_answer,
+                                question_text=question_text,
+                                options=options,
+                                grading_client=grading_client,
+                                grading_model_name=grading_model_name,
+                                verbose=False
+                            )
+                            new_argonium_correct = grading_result.get("is_correct", False)
+                        
+                        # Compare results
+                        file_correct = (file_score >= 1)
+                        if file_correct == new_argonium_correct:
+                            file_vs_new_matches += 1
+                        else:
+                            file_vs_new_discrepancies += 1
+        
+        print(f"Argonium file loaded: {args.argonium_results}")
+        print(f"Argonium file accuracy: {argonium_file_accuracy:.1f}%")
+        print(f"Questions with file comparison: {file_comparison_count}")
+        print(f"Questions verified to match: {matched_questions}")
+        
+        if matched_questions > 0 and dual_prediction_used:
+            print(f"\n🔄 FILE vs NEW ARGONIUM-STYLE PREDICTIONS:")
+            print(f"Agreements: {file_vs_new_matches}")
+            print(f"Discrepancies: {file_vs_new_discrepancies}")
+            if file_vs_new_matches + file_vs_new_discrepancies > 0:
+                agreement_pct = (file_vs_new_matches / (file_vs_new_matches + file_vs_new_discrepancies)) * 100
+                print(f"Agreement rate: {agreement_pct:.1f}%")
+                
+            # Detailed discrepancy analysis
+            if file_vs_new_discrepancies > 0:
+                print(f"\n🔍 DETAILED DISCREPANCY ANALYSIS:")
+                file_correct_new_wrong = 0
+                file_wrong_new_correct = 0
+                both_wrong_different_answers = 0
+                extraction_failures = 0
+                
+                for trace in results:
+                    if trace.get("argonium_file_comparison") and trace.get("dual_prediction"):
+                        comparison = trace["argonium_file_comparison"]
+                        question_match = comparison.get("question_match", {})
+                        
+                        if question_match.get("is_match", False):
+                            argonium_file_result = comparison.get("argonium_result", {})
+                            file_score = argonium_file_result.get("score", 0)
+                            file_correct = (file_score >= 1)
+                            
+                            dual_data = trace["dual_prediction"]
+                            argonium_pred = dual_data.get("argonium_prediction", {})
+                            new_extraction_successful = argonium_pred.get("extraction_successful", False)
+                            
+                            # Check for correctness using grading if available
+                            new_argonium_correct = False
+                            if new_extraction_successful and grading_client and grading_model_name:
+                                argonium_answer = argonium_pred.get("predicted_answer", "")
+                                correct_answer = trace.get("correct_answer", "")
+                                question_text = trace.get("question", "")
+                                options = trace.get("options", [])
+                                
+                                if argonium_answer and correct_answer:
+                                    grading_result = grade_answer(
+                                        predicted_answer=argonium_answer,
+                                        correct_answer=correct_answer,
+                                        question_text=question_text,
+                                        options=options,
+                                        grading_client=grading_client,
+                                        grading_model_name=grading_model_name,
+                                        verbose=False
+                                    )
+                                    new_argonium_correct = grading_result.get("is_correct", False)
+                            
+                            # Categorize discrepancies
+                            if file_correct != new_argonium_correct:
+                                if file_correct and not new_argonium_correct:
+                                    file_correct_new_wrong += 1
+                                elif not file_correct and new_argonium_correct:
+                                    file_wrong_new_correct += 1
+                                elif not file_correct and not new_argonium_correct:
+                                    both_wrong_different_answers += 1
+                            
+                            if not new_extraction_successful:
+                                extraction_failures += 1
+                
+                print(f"  File correct, new wrong: {file_correct_new_wrong}")
+                print(f"  File wrong, new correct: {file_wrong_new_correct}")
+                print(f"  Both wrong, different answers: {both_wrong_different_answers}")
+                print(f"  New method extraction failures: {extraction_failures}")
+                
+                if file_correct_new_wrong > 0:
+                    print(f"  ⚠️  Regression: {file_correct_new_wrong} cases where file method was better")
+                if file_wrong_new_correct > 0:
+                    print(f"  📈 Improvement: {file_wrong_new_correct} cases where new method is better")
+        
+        print("=" * 60)
 
     print("=" * 80)
 
