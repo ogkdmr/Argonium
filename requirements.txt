@@ -34,3 +34,7 @@ jupyter>=1.0.0
 # For progress tracking and logging
 colorama>=0.4.4
 rich>=10.0.0
+
+# For processing distllm's HF datasets.
+datasets
+
