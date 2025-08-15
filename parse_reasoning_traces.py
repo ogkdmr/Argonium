@@ -71,7 +71,7 @@ def parse_reasoning_file(input_file_path, output_dir):
         reasoning_traces = question_data.get("reasoning_traces", {})
         predictions = question_data.get("predictions", {})
 
-        # Create a unique hash for this question to enable tracking
+        # Ensure consistent use of the correct_answer field for hash generation
         question_hash = create_question_hash(question, correct_answer)
 
         # Process each successful mode

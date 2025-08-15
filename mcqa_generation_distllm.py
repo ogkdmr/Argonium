@@ -1091,8 +1091,8 @@ def process_dataset(
     min_score: int,
     checkpoint_file: str,
     force_restart: bool = False,
-    workers: int = None,
-    max_chunks: int = None,
+    workers: Optional[int] = None,
+    max_chunks: Optional[int] = None,
 ):
     """
     Main processing function for the Hugging Face dataset.
